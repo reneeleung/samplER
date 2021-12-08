@@ -71,11 +71,16 @@ class SumTree:
         return self.tree[0]  # Returns the root node
 
 def create_model(lr):
-    model = keras.Sequential([
-        keras.layers.Dense(128, activation='relu', input_shape=(state_size,)),
-        keras.layers.Dense(128, activation='relu'),
-        keras.layers.Dense(action_size, activation='relu')]
-    )
+    inputs = tf.keras.Input(shape=(state_size,))
+    fc1 = tf.keras.layers.Dense(128, activation='relu')(inputs)
+    fc2 = tf.keras.layers.Dense(128, activation='relu')(fc1)
+    advantage_output = tf.keras.layers.Dense(action_size, activation='linear')(fc2)
+
+    value_out = tf.keras.layers.Dense(1, activation='linear')(fc2)
+    norm_advantage_output = tf.keras.layers.Lambda(lambda x: x - tf.reduce_mean(x))(advantage_output)
+    outputs = tf.keras.layers.Add()([value_out, norm_advantage_output])
+    model = tf.keras.Model(inputs, outputs)
+
     model.compile(optimizer=tf.keras.optimizers.Adam(lr), loss='mse', metrics=['accuracy'])
     return model
 
@@ -210,14 +215,41 @@ class DQNAgent:
             rewards = np.vstack([data[2] for data in batches])
             next_states = np.vstack([data[3] for data in batches])
             dones = np.vstack([data[4] for data in batches])
-            y = self.model(states).numpy()
-            n_gamma = self.gamma ** self.n_step
-            y_reward = np.where(dones, rewards, rewards + n_gamma*np.max(self.target_model(next_states).numpy()))
-            y[np.arange(self.batch_size), actions] = y_reward
-            y_pred = self.model(states).numpy()
-            td_errors = np.sum(np.abs(y_pred-y), axis=1)
-            self.model.fit(states, y, epochs=64, verbose=0, sample_weight=batch_ISWeights)
+            td_errors, loss = self._train_body(states, actions, rewards, next_states, dones, batch_ISWeights)
             self.batch_update(batch_index, td_errors)
+
+    @tf.function
+    def _train_body(self, states, actions, rewards, next_states, dones, weights):
+        weights = tf.cast(weights, dtype=tf.float32)
+        with tf.GradientTape() as tape:
+            td_errors = self._compute_td_error_body(states, actions, rewards, next_states, dones)
+            loss = tf.reduce_mean(tf.square(weights * td_errors))  # huber loss seems no use
+        gradients = tape.gradient(loss, self.model.trainable_variables)
+        self.model.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+        return td_errors, loss
+
+    @tf.function
+    def _compute_td_error_body(self, states, actions, rewards, next_states, dones):
+        rewards = tf.cast(tf.squeeze(rewards), dtype=tf.float32)
+        dones = tf.cast(tf.squeeze(dones), dtype=tf.bool)
+        actions = tf.cast(actions, dtype=tf.int32)  # (batch_size, 1)
+        batch_size_range = tf.expand_dims(tf.range(self.batch_size), axis=1)  # (batch_size, 1)
+
+        # get current q value
+        current_q_indexes = tf.concat(values=(batch_size_range, actions), axis=1)  # (batch_size, 2)
+        current_q = tf.gather_nd(self.model(states), current_q_indexes)  # (batch_size, )
+
+        # get target q value using double dqn
+        max_next_q_indexes = tf.argmax(self.model(next_states), axis=1, output_type=tf.int32)  # (batch_size, )
+        indexes = tf.concat(values=(batch_size_range,
+                                    tf.expand_dims(max_next_q_indexes, axis=1)), axis=1)  # (batch_size, 2)
+        target_q = tf.gather_nd(self.target_model(next_states), indexes)  # (batch_size, )
+
+        target_q = tf.where(dones, rewards, rewards + self.gamma * target_q)  # (batch_size, )
+        # don't want change the weights of target network in backpropagation, so tf.stop_gradient()
+        # but seems no use
+        td_errors = tf.abs(current_q - tf.stop_gradient(target_q))
+        return td_errors
 
     def acting(self, state):
         if self.render:
