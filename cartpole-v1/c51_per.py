@@ -4,20 +4,71 @@ import gym
 import numpy as np
 import tensorflow.keras as keras
 import time
-import random
 from collections import deque
 import matplotlib.pyplot as plt
 
 tf.get_logger().setLevel('ERROR')
-episodes = 8000
+episodes = 1000
 step_limit = 200
 memory_size = 100000
-env = gym.make('MountainCar-v0')
+env = gym.make('CartPole-v1')
 env.seed(777)
 state_size = env.observation_space.shape[0]
 action_size = env.action_space.n
 
-saveFileName = 'categorical_er'
+saveFileName = 'categorical'
+
+
+# leaves contain priorities for every experience.A data array containing the experiences points to the leaves.
+# priorities are determined due to their TD error.
+# Updating the tree and sampling will be really efficient (O(log n)).
+# the value of root node is the sum of its child nodes
+class SumTree:
+    def __init__(self, capacity):
+        self.data_pointer = 0
+        self.capacity = capacity
+        self.tree = np.zeros(2 * self.capacity - 1)
+        self.data = np.zeros(self.capacity, dtype=object)
+
+    def add(self, priority, data):
+        # the overall nodes is capacity(leaves) + capacity - 1
+        tree_index = self.data_pointer + self.capacity - 1
+        self.data[self.data_pointer] = data
+        self.update(tree_index, priority)
+        self.data_pointer += 1
+        if self.data_pointer >= self.capacity:
+            self.data_pointer = 0
+
+    def update(self, tree_index, priority):
+        changed_value = priority - self.tree[tree_index]
+        self.tree[tree_index] = priority
+        # if index = 6, then index = 2 and index = 0 in tree will add changed_value
+        while tree_index != 0:
+            tree_index = (tree_index - 1) // 2
+            self.tree[tree_index] += changed_value
+
+    def get_leaf(self, v):
+        parent_index = 0
+        while True:
+            left_child_index = 2 * parent_index + 1
+            right_child_index = left_child_index + 1
+            if left_child_index >= len(self.tree):
+                leaf_index = parent_index
+                break
+            else:
+                if v <= self.tree[left_child_index]:
+                    parent_index = left_child_index
+                else:
+                    v -= self.tree[left_child_index]
+                    parent_index = right_child_index
+        data_index = leaf_index - self.capacity + 1
+        return leaf_index, self.tree[leaf_index], self.data[data_index]
+
+    # an alternative method for getter and setter
+    # we could directly use self.total_priority instead of self.get_total_priority()
+    @property
+    def total_priority(self):
+        return self.tree[0]  # Returns the root node
 
 
 class Network(tf.keras.Model):
@@ -92,15 +143,19 @@ class DQNAgent:
         self.fixed_q_value_steps = 100
         self.target_network_counter = 0
 
-        # n-step learning
-        self.n_step = 3
-        self.n_step_buffer = deque(maxlen=self.n_step)
-
-        # experience replay
+        # experience replay used SumTree
+        # combine agent and PER
         self.batch_size = 64
         self.gamma = 0.9
         self.replay_start_size = 320
-        self.experience_replay = deque(maxlen=memory_size)
+        self.experience_replay = SumTree(memory_size)
+        self.PER_e = 0.01  # epsilon -> pi = |delta| + epsilon transitions which have zero error also have chance to be selected
+        self.PER_a = 0.6  # P(i) = p(i) ** a / total_priority ** a
+        self.PER_b = 0.4
+        self.PER_b_increment = 0.002
+        self.absolute_error_upper = 1.  # clipped error
+        self.experience_number = 0
+        # initially, p1=1 total_priority=1,so P(1)=1,w1=batchsize**beta
 
         # categorical DQN
         self.optimizer = tf.keras.optimizers.Adam(self.learning_rate)
@@ -119,48 +174,67 @@ class DQNAgent:
             self.target_model = Network(self.support, self.atom_size)
             # self.target_model.predict(np.zeros((1,state_size)))
 
-    # n-step learning, get the truncated n-step return
-    def get_n_step_info(self, n_step_buffer, gamma):
-        """Return n step reward, next state, and done."""
-        # info of the last transition
-        reward, next_state, done = n_step_buffer[-1][-3:]
-
-        for transition in reversed(list(n_step_buffer)[:-1]):
-            r, n_s, d = transition[-3:]
-
-            reward = r + gamma * reward * (1 - d)
-            next_state, done = (n_s, d) if d else (next_state, done)
-
-        return reward, next_state, done
-
-    # these methods:sample,store are used in experience replay
+    # these three methods:sample,store,batch_update are used in experience replay
     def sample(self, n):
-        return random.sample(self.experience_replay, n)
+        mini_batch = []
+        batch_index = np.empty((n,), dtype=int)
+        batch_ISWeights = np.empty((n,), dtype=float)
+        priority_segment = self.experience_replay.total_priority / n
+        if self.PER_b < 1:
+            self.PER_b += self.PER_b_increment
 
+        min_priority_probability = np.min(
+            self.experience_replay.tree[-self.experience_replay.capacity:]) / self.experience_replay.total_priority
+        if min_priority_probability == 0:
+            min_priority_probability = 1 / memory_size
+        # max_weight = (min_priority_probability * memory_size) ** (-self.PER_b)
+        for i in range(n):
+            a = priority_segment * i
+            b = priority_segment * (i + 1)
+            value = np.random.uniform(a, b)
+            index, priority, data = self.experience_replay.get_leaf(value)
+            sampling_probability = priority / self.experience_replay.total_priority
+            batch_ISWeights[i] = np.power(sampling_probability / min_priority_probability, -self.PER_b)
+            batch_index[i] = index
+            mini_batch.append(data)
+        return batch_index, mini_batch, batch_ISWeights
+
+    # newly transitions have max_priority or 1 at first transition
     def store(self, experience):
-        # n_step
-        self.n_step_buffer.append(experience)
-        if len(self.n_step_buffer) == self.n_step:
-            reward, next_state, done = self.get_n_step_info(self.n_step_buffer, self.gamma)
-            state, action = self.n_step_buffer[0][:2]
-            self.experience_replay.append((state, action, reward, next_state, done))
+        max_priority = np.max(self.experience_replay.tree[-self.experience_replay.capacity:])
+        if max_priority == 0:
+            max_priority = self.absolute_error_upper
+        if self.experience_number < memory_size:
+            self.experience_number += 1
+
+        self.experience_replay.add(max_priority, (state, action, reward, next_state, done))
+
+    def batch_update(self, tree_index, abs_errors):
+        abs_errors = tf.add(abs_errors, self.PER_e)
+        clipped_errors = np.minimum(abs_errors, self.absolute_error_upper)
+        priorities = np.power(clipped_errors, self.PER_a)
+        for index, priority in zip(tree_index, priorities):
+            self.experience_replay.update(index, priority)
 
     def training(self):
-        if len(self.experience_replay) >= self.replay_start_size:
-            batches = self.sample(self.batch_size)
+        if self.experience_number >= self.replay_start_size:
+            batch_index, batches, batch_ISWeights = self.sample(self.batch_size)
             states = np.vstack([data[0] for data in batches])
             actions = np.vstack([data[1] for data in batches])
             rewards = np.vstack([data[2] for data in batches])
             next_states = np.vstack([data[3] for data in batches])
             dones = np.vstack([data[4] for data in batches])
-            self.train_body(states, actions, rewards, next_states, dones)
+
+            td_errors = self.train_body(states, actions, rewards, next_states, dones, batch_ISWeights)
+            self.batch_update(batch_index, td_errors)
 
     @tf.function
-    def train_body(self, states, actions, rewards, next_states, dones):
+    def train_body(self, states, actions, rewards, next_states, dones, weights):
+        weights = tf.cast(weights, dtype=tf.float32)
         with tf.GradientTape() as tape:
             elementwise_loss = self._compute_td_error_body(states, actions, rewards, next_states, dones)
             absolute_errors = tf.abs(elementwise_loss)
-            loss = tf.reduce_mean(elementwise_loss)
+            loss = tf.reduce_mean(weights * elementwise_loss)
         gradients = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
         return absolute_errors
@@ -176,8 +250,7 @@ class DQNAgent:
         next_dist = self.target_model.dist(next_states)
         next_dist = tf.gather_nd(next_dist, next_indexes)
 
-        n_gamma = self.gamma ** self.n_step
-        t_z = tf.where(dones, rewards, rewards + n_gamma * self.support)  # (batch_size, )
+        t_z = tf.where(dones, rewards, rewards + self.gamma * self.support)  # (batch_size, )
         t_z = tf.clip_by_value(t_z, self.v_min, self.v_max)
         b = tf.cast((t_z - self.v_min) / self.delta_z, tf.float32)
         l = tf.cast(tf.math.floor(b), tf.int32)
@@ -247,9 +320,10 @@ for _ in range(num_trials):
                     scores_window.append(rewards)
 
                     break
-            print('\rEpisode {}\tAverage Score: {:.2f}\tepsilon:{:.2f}'.format(episode,
+            print('\rEpisode {}\tAverage Score: {:.2f}\tepsilon:{:.2f}\tper_beta: {:.2f}'.format(episode,
                                                                                                  np.mean(scores_window),
-                                                                                                 agent.epsilon), end="")
+                                                                                                 agent.epsilon,
+                                                                                                 agent.PER_b), end="")
 
             if np.mean(scores_window) > 195:
                 print("\nproblem solved in {} episode with {:.2f} seconds".format(episode, time.time() - start))
@@ -263,11 +337,11 @@ plt.figure(figsize=(20,5))
 plt.plot(np.arange(episodes), np.mean(plot_rewards, axis=0))
 plt.xlabel('Episodes')
 plt.ylabel('Rewards')
-plt.savefig('C51_ER_nstep.png')
+plt.savefig('C51_PER.png')
 print('plotted')
 
 import pickle
-with open('c51_er_nstep.pkl','wb') as f:
+with open('c51_per.pkl','wb') as f:
     pickle.dump(np.mean(plot_rewards, axis=0), f)
 env.close()
 

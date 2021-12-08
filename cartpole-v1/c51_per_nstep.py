@@ -239,17 +239,6 @@ class DQNAgent:
         for index, priority in zip(tree_index, priorities):
             self.experience_replay.update(index, priority)
 
-    def create_model(self):
-        inputs = tf.keras.Input(shape=(state_size,))
-        fc1 = tf.keras.layers.Dense(128, activation='relu')(inputs)
-        fc2 = tf.keras.layers.Dense(128, activation='relu')(fc1)
-        advantage_output = tf.keras.layers.Dense(action_size, activation='linear')(fc2)
-        model = tf.keras.Model(inputs, advantage_output)
-        model.compile(optimizer=tf.keras.optimizers.Adam(self.learning_rate),
-                      loss='mse',
-                      metrics=['accuracy'])
-        return model
-
     def training(self):
         if self.experience_number >= self.replay_start_size:
             batch_index, batches, batch_ISWeights = self.sample(self.batch_size)

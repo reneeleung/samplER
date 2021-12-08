@@ -7,17 +7,18 @@ import time
 import random
 from collections import deque
 import matplotlib.pyplot as plt
+from utils.random_dict import RandomDict
 
 tf.get_logger().setLevel('ERROR')
-episodes = 8000
+episodes = 1000
 step_limit = 200
 memory_size = 100000
-env = gym.make('MountainCar-v0')
+env = gym.make('CartPole-v1')
 env.seed(777)
 state_size = env.observation_space.shape[0]
 action_size = env.action_space.n
 
-saveFileName = 'categorical_er'
+saveFileName = 'categorical_ser'
 
 
 class Network(tf.keras.Model):
@@ -92,15 +93,14 @@ class DQNAgent:
         self.fixed_q_value_steps = 100
         self.target_network_counter = 0
 
-        # n-step learning
-        self.n_step = 3
-        self.n_step_buffer = deque(maxlen=self.n_step)
-
         # experience replay
         self.batch_size = 64
         self.gamma = 0.9
         self.replay_start_size = 320
         self.experience_replay = deque(maxlen=memory_size)
+        self.pair_to_indices_dict = RandomDict()
+        self.size_now = 0
+        self.i = 0
 
         # categorical DQN
         self.optimizer = tf.keras.optimizers.Adam(self.learning_rate)
@@ -119,31 +119,44 @@ class DQNAgent:
             self.target_model = Network(self.support, self.atom_size)
             # self.target_model.predict(np.zeros((1,state_size)))
 
-    # n-step learning, get the truncated n-step return
-    def get_n_step_info(self, n_step_buffer, gamma):
-        """Return n step reward, next state, and done."""
-        # info of the last transition
-        reward, next_state, done = n_step_buffer[-1][-3:]
+    # these methods:sample,store are used in stratified experience replay
+    def _make_pair(self, observation, action):
+        return(hash(observation.tostring()),action)
 
-        for transition in reversed(list(n_step_buffer)[:-1]):
-            r, n_s, d = transition[-3:]
+    def _sample_index(self, nsteps=1):
+        index_deque = self.pair_to_indices_dict.random_value()
+        x = random.choice(index_deque)
+        # Make sure the sampled index has room to bootstrap
+        if (x - self.i) % self.size_now >= memory_size - nsteps:
+            # It's too close to the pointer; recurse and try again
+            return self._sample_index(nsteps)
+        return x
 
-            reward = r + gamma * reward * (1 - d)
-            next_state, done = (n_s, d) if d else (next_state, done)
-
-        return reward, next_state, done
-
-    # these methods:sample,store are used in experience replay
     def sample(self, n):
-        return random.sample(self.experience_replay, n)
+        # Sample indices for the minibatch
+        i = np.asarray([self._sample_index() for _ in range(n)])
+        batches = [self.experience_replay[j] for j in i]
+        return batches
 
     def store(self, experience):
-        # n_step
-        self.n_step_buffer.append(experience)
-        if len(self.n_step_buffer) == self.n_step:
-            reward, next_state, done = self.get_n_step_info(self.n_step_buffer, self.gamma)
-            state, action = self.n_step_buffer[0][:2]
+        # if memory is full
+        if len(self.experience_replay) >= memory_size:
+            s, a, r, ns, d = self.experience_replay[self.i]
+            old_pair = self._make_pair(s, a)
+            old_index_deque = self.pair_to_indices_dict[old_pair]
+            old_index_deque.popleft()
+            if not old_index_deque:
+                self.pair_to_indices_dict.pop(old_pair)
+        new_pair = self._make_pair(state, action)
+        if new_pair not in self.pair_to_indices_dict:
+            self.pair_to_indices_dict[new_pair] = deque()
+        self.pair_to_indices_dict[new_pair].append(self.i)
+        if len(self.experience_replay) >= memory_size:
+            self.experience_replay[self.i] = (state, action, reward, next_state, done)
+        else:
             self.experience_replay.append((state, action, reward, next_state, done))
+        self.i = (self.i + 1) % memory_size
+        self.size_now = min(self.size_now+1, memory_size)
 
     def training(self):
         if len(self.experience_replay) >= self.replay_start_size:
@@ -176,8 +189,7 @@ class DQNAgent:
         next_dist = self.target_model.dist(next_states)
         next_dist = tf.gather_nd(next_dist, next_indexes)
 
-        n_gamma = self.gamma ** self.n_step
-        t_z = tf.where(dones, rewards, rewards + n_gamma * self.support)  # (batch_size, )
+        t_z = tf.where(dones, rewards, rewards + self.gamma * self.support)  # (batch_size, )
         t_z = tf.clip_by_value(t_z, self.v_min, self.v_max)
         b = tf.cast((t_z - self.v_min) / self.delta_z, tf.float32)
         l = tf.cast(tf.math.floor(b), tf.int32)
@@ -263,11 +275,11 @@ plt.figure(figsize=(20,5))
 plt.plot(np.arange(episodes), np.mean(plot_rewards, axis=0))
 plt.xlabel('Episodes')
 plt.ylabel('Rewards')
-plt.savefig('C51_ER_nstep.png')
+plt.savefig('C51_SER.png')
 print('plotted')
 
 import pickle
-with open('c51_er_nstep.pkl','wb') as f:
+with open('c51_ser.pkl','wb') as f:
     pickle.dump(np.mean(plot_rewards, axis=0), f)
 env.close()
 

@@ -145,17 +145,6 @@ class DQNAgent:
             state, action = self.n_step_buffer[0][:2]
             self.experience_replay.append((state, action, reward, next_state, done))
 
-    def create_model(self):
-        inputs = tf.keras.Input(shape=(state_size,))
-        fc1 = tf.keras.layers.Dense(128, activation='relu')(inputs)
-        fc2 = tf.keras.layers.Dense(128, activation='relu')(fc1)
-        advantage_output = tf.keras.layers.Dense(action_size, activation='linear')(fc2)
-        model = tf.keras.Model(inputs, advantage_output)
-        model.compile(optimizer=tf.keras.optimizers.Adam(self.learning_rate),
-                      loss='mse',
-                      metrics=['accuracy'])
-        return model
-
     def training(self):
         if len(self.experience_replay) >= self.replay_start_size:
             batches = self.sample(self.batch_size)
