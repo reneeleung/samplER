@@ -7,7 +7,6 @@ import time
 import random
 from collections import deque
 import matplotlib.pyplot as plt
-from utils.random_dict import RandomDict
 
 tf.get_logger().setLevel('ERROR')
 episodes = 8000
@@ -18,7 +17,7 @@ env.seed(777)
 state_size = env.observation_space.shape[0]
 action_size = env.action_space.n
 
-saveFileName = 'categorical_ser'
+saveFileName = 'categorical_laber'
 
 
 class Network(tf.keras.Model):
@@ -98,9 +97,6 @@ class DQNAgent:
         self.gamma = 0.9
         self.replay_start_size = 320
         self.experience_replay = deque(maxlen=memory_size)
-        self.pair_to_indices_dict = RandomDict()
-        self.size_now = 0
-        self.i = 0
 
         # categorical DQN
         self.optimizer = tf.keras.optimizers.Adam(self.learning_rate)
@@ -119,47 +115,16 @@ class DQNAgent:
             self.target_model = Network(self.support, self.atom_size)
             # self.target_model.predict(np.zeros((1,state_size)))
 
-    # these methods:sample,store are used in stratified experience replay
-    def _make_pair(self, observation, action):
-        return(hash(observation.tostring()),action)
-
-    def _sample_index(self, nsteps=1):
-        index_deque = self.pair_to_indices_dict.random_value()
-        x = random.choice(index_deque)
-        # Make sure the sampled index has room to bootstrap
-        if (x - self.i) % self.size_now >= memory_size - nsteps:
-            # It's too close to the pointer; recurse and try again
-            return self._sample_index(nsteps)
-        return x
-
+    # these methods:sample,store are used in experience replay
     def sample(self, n):
-        # Sample indices for the minibatch
-        i = np.asarray([self._sample_index() for _ in range(n)])
-        batches = [self.experience_replay[j] for j in i]
-        return batches
+        return random.sample(self.experience_replay, n)
 
     def store(self, experience):
-        # if memory is full
-        if len(self.experience_replay) >= memory_size:
-            s, a, r, ns, d = self.experience_replay[self.i]
-            old_pair = self._make_pair(s, a)
-            old_index_deque = self.pair_to_indices_dict[old_pair]
-            old_index_deque.popleft()
-            if not old_index_deque:
-                self.pair_to_indices_dict.pop(old_pair)
-        new_pair = self._make_pair(state, action)
-        if new_pair not in self.pair_to_indices_dict:
-            self.pair_to_indices_dict[new_pair] = deque()
-        self.pair_to_indices_dict[new_pair].append(self.i)
-        if len(self.experience_replay) >= memory_size:
-            self.experience_replay[self.i] = (state, action, reward, next_state, done)
-        else:
-            self.experience_replay.append((state, action, reward, next_state, done))
-        self.i = (self.i + 1) % memory_size
-        self.size_now = min(self.size_now+1, memory_size)
+        self.experience_replay.append((state, action, reward, next_state, done))
 
     def training(self):
         if len(self.experience_replay) >= self.replay_start_size:
+            # sample uniformly a large batch from the replay buffer
             batches = self.sample(self.batch_size)
             states = np.vstack([data[0] for data in batches])
             actions = np.vstack([data[1] for data in batches])
@@ -170,13 +135,27 @@ class DQNAgent:
 
     @tf.function
     def train_body(self, states, actions, rewards, next_states, dones):
+        # assume we just sampled a mini-batch of size 4 * batch_size
+        minibatch_size = int(states.shape[0]/4)
         with tf.GradientTape() as tape:
+            tape.watch(self.model.trainable_weights)
             elementwise_loss = self._compute_td_error_body(states, actions, rewards, next_states, dones)
             absolute_errors = tf.abs(elementwise_loss)
-            loss = tf.reduce_mean(elementwise_loss)
+
+            # sub-sample the large batch according to surrogate priorities (TD errors)
+            priorities = absolute_errors / tf.reduce_sum(absolute_errors)
+            #indices = np.random.choice(np.arange(int(self.batch_size)), minibatch_size, p=priorities)
+            indices = tf.random.categorical(tf.math.log([priorities]), minibatch_size)
+
+            # compute weights for SGD update
+            # LaBER mean
+            weights = tf.reduce_mean(priorities) / tf.gather(priorities, indices)
+            elementwise_loss = tf.gather(elementwise_loss, indices)
+            assert elementwise_loss.shape == weights.shape
+            loss = tf.reduce_mean(weights *elementwise_loss)
         gradients = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-        return absolute_errors
+        return tf.abs(elementwise_loss)
 
     @tf.function
     def _compute_td_error_body(self, states, actions, rewards, next_states, dones):
@@ -186,7 +165,7 @@ class DQNAgent:
         batch_size_range = tf.expand_dims(tf.range(self.batch_size, dtype=tf.int64), axis=1)  # (batch_size, 1)
         max_action_next = tf.expand_dims(max_action_next, axis=1)
         next_indexes = tf.concat(values=(batch_size_range, max_action_next), axis=1)  # (batch_size, 2)
-        next_dist = self.target_model.dist(next_states)
+        next_dist = tf.stop_gradient(self.target_model.dist(next_states))
         next_dist = tf.gather_nd(next_dist, next_indexes)
 
         t_z = tf.where(dones, rewards, rewards + self.gamma * self.support)  # (batch_size, )
@@ -275,11 +254,11 @@ plt.figure(figsize=(20,5))
 plt.plot(np.arange(episodes), np.mean(plot_rewards, axis=0))
 plt.xlabel('Episodes')
 plt.ylabel('Rewards')
-plt.savefig('C51_SER.png')
+plt.savefig('C51_LABER.png')
 print('plotted')
 
 import pickle
-with open('c51_ser.pkl','wb') as f:
+with open('c51_laber.pkl','wb') as f:
     pickle.dump(np.mean(plot_rewards, axis=0), f)
 env.close()
 

@@ -3,22 +3,22 @@ import tensorflow as tf
 import gym
 import numpy as np
 import tensorflow.keras as keras
+from sklearn.cluster import KMeans
 import time
 import random
 from collections import deque
 import matplotlib.pyplot as plt
-from utils.random_dict import RandomDict
 
 tf.get_logger().setLevel('ERROR')
-episodes = 8000
+episodes = 1000
 step_limit = 200
 memory_size = 100000
-env = gym.make('MountainCar-v0')
+env = gym.make('CartPole-v1')
 env.seed(777)
 state_size = env.observation_space.shape[0]
 action_size = env.action_space.n
 
-saveFileName = 'categorical_ser'
+saveFileName = 'categorical_statedist'
 
 
 class Network(tf.keras.Model):
@@ -98,9 +98,7 @@ class DQNAgent:
         self.gamma = 0.9
         self.replay_start_size = 320
         self.experience_replay = deque(maxlen=memory_size)
-        self.pair_to_indices_dict = RandomDict()
-        self.size_now = 0
-        self.i = 0
+        self.kmeans = None
 
         # categorical DQN
         self.optimizer = tf.keras.optimizers.Adam(self.learning_rate)
@@ -119,48 +117,42 @@ class DQNAgent:
             self.target_model = Network(self.support, self.atom_size)
             # self.target_model.predict(np.zeros((1,state_size)))
 
-    # these methods:sample,store are used in stratified experience replay
-    def _make_pair(self, observation, action):
-        return(hash(observation.tostring()),action)
-
-    def _sample_index(self, nsteps=1):
-        index_deque = self.pair_to_indices_dict.random_value()
-        x = random.choice(index_deque)
-        # Make sure the sampled index has room to bootstrap
-        if (x - self.i) % self.size_now >= memory_size - nsteps:
-            # It's too close to the pointer; recurse and try again
-            return self._sample_index(nsteps)
-        return x
-
-    def sample(self, n):
-        # Sample indices for the minibatch
-        i = np.asarray([self._sample_index() for _ in range(n)])
-        batches = [self.experience_replay[j] for j in i]
-        return batches
+    # these methods:sample,store are used in experience replay
+    def sample(self, n, re_eval=False):
+        """
+           Re-evaluate kmeans if re_eval=True"
+        """
+        n_clusters = 64
+        states = np.vstack([data[0] for data in self.experience_replay])
+        if re_eval:
+            self.kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(states)
+            labels = self.kmeans.labels_
+        else:
+            labels = self.kmeans.predict(states)
+        h = dict()
+        for c in range(n_clusters):
+            h[c] = (labels == c).sum()
+        counts = np.array([h[c] for c in labels])
+        probabilities = 1./ (n_clusters * counts)
+        return random.choices(self.experience_replay, weights=probabilities, k=n)
 
     def store(self, experience):
-        # if memory is full
-        if len(self.experience_replay) >= memory_size:
-            s, a, r, ns, d = self.experience_replay[self.i]
-            old_pair = self._make_pair(s, a)
-            old_index_deque = self.pair_to_indices_dict[old_pair]
-            old_index_deque.popleft()
-            if not old_index_deque:
-                self.pair_to_indices_dict.pop(old_pair)
-        new_pair = self._make_pair(state, action)
-        if new_pair not in self.pair_to_indices_dict:
-            self.pair_to_indices_dict[new_pair] = deque()
-        self.pair_to_indices_dict[new_pair].append(self.i)
-        if len(self.experience_replay) >= memory_size:
-            self.experience_replay[self.i] = (state, action, reward, next_state, done)
-        else:
-            self.experience_replay.append((state, action, reward, next_state, done))
-        self.i = (self.i + 1) % memory_size
-        self.size_now = min(self.size_now+1, memory_size)
+        self.experience_replay.append((state, action, reward, next_state, done))
 
-    def training(self):
+    def create_model(self):
+        inputs = tf.keras.Input(shape=(state_size,))
+        fc1 = tf.keras.layers.Dense(128, activation='relu')(inputs)
+        fc2 = tf.keras.layers.Dense(128, activation='relu')(fc1)
+        advantage_output = tf.keras.layers.Dense(action_size, activation='linear')(fc2)
+        model = tf.keras.Model(inputs, advantage_output)
+        model.compile(optimizer=tf.keras.optimizers.Adam(self.learning_rate),
+                      loss='mse',
+                      metrics=['accuracy'])
+        return model
+
+    def training(self, re_eval):
         if len(self.experience_replay) >= self.replay_start_size:
-            batches = self.sample(self.batch_size)
+            batches = self.sample(self.batch_size, re_eval or len(self.experience_replay)==self.replay_start_size)
             states = np.vstack([data[0] for data in batches])
             actions = np.vstack([data[1] for data in batches])
             rewards = np.vstack([data[2] for data in batches])
@@ -235,7 +227,8 @@ class DQNAgent:
 
 num_trials = 3
 plot_rewards = []
-for _ in range(num_trials):
+for k in range(num_trials):
+    print(f'trial {k}')
     agent = DQNAgent()
     episode_rewards = []
     if agent.isTraining:
@@ -245,6 +238,7 @@ for _ in range(num_trials):
             rewards = 0
             state = env.reset()
             state = np.array([state])
+            steps = 0
             while True:
                 action = agent.acting(state)
                 next_state, reward, done, _ = env.step(action)
@@ -253,8 +247,15 @@ for _ in range(num_trials):
                 reward = -10 if done else reward
                 agent.store((state, action, reward, next_state, done))
                 state = next_state
-                agent.training()
-                if done or rewards >= step_limit:
+                if episode < 200:
+                    interval = 20
+                elif episode < 600:
+                    interval = 50
+                else:
+                    interval = 100
+                agent.training(steps % interval == 0)
+                steps += 1
+                if done or steps >= step_limit:
                     episode_rewards.append(rewards)
                     scores_window.append(rewards)
 
@@ -275,11 +276,11 @@ plt.figure(figsize=(20,5))
 plt.plot(np.arange(episodes), np.mean(plot_rewards, axis=0))
 plt.xlabel('Episodes')
 plt.ylabel('Rewards')
-plt.savefig('C51_SER.png')
+plt.savefig('C51_statedist.png')
 print('plotted')
 
 import pickle
-with open('c51_ser.pkl','wb') as f:
+with open('c51_statedist.pkl','wb') as f:
     pickle.dump(np.mean(plot_rewards, axis=0), f)
 env.close()
 

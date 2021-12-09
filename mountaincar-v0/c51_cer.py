@@ -10,10 +10,10 @@ from itertools import islice
 import matplotlib.pyplot as plt
 
 tf.get_logger().setLevel('ERROR')
-episodes = 1000
+episodes = 8000
 step_limit = 200
 memory_size = 100000
-env = gym.make('CartPole-v1')
+env = gym.make('MountainCar-v0')
 env.seed(777)
 state_size = env.observation_space.shape[0]
 action_size = env.action_space.n

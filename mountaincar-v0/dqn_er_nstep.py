@@ -17,44 +17,23 @@ env.seed(777)
 state_size = env.observation_space.shape[0]
 action_size = env.action_space.n
 
-saveFileName = 'categorical_er'
+saveFileName = 'dqn_er'
 
+def create_model(lr):
+    inputs = keras.Input(shape=(state_size,))
+    fc1 = keras.layers.Dense(128, activation='relu')(inputs)
+    fc2 = keras.layers.Dense(128, activation='relu')(fc1)
+    advantage_output = keras.layers.Dense(action_size, activation='linear')(fc2)
 
-class Network(tf.keras.Model):
-    def __init__(self, support, atom_size):
-        super(Network, self).__init__()
+    value_out = keras.layers.Dense(1, activation='linear')(fc2)
+    norm_advantage_output = keras.layers.Lambda(lambda x: x - tf.reduce_mean(x))(advantage_output)
+    outputs = keras.layers.Add()([value_out, norm_advantage_output])
+    model = keras.Model(inputs, outputs)
 
-        self.support = support
-        self.atom_size = atom_size
-
-        self.fc1 = tf.keras.layers.Dense(128)
-        self.fc2 = tf.keras.layers.Dense(128)
-        self.advantage_output = tf.keras.layers.Dense(atom_size * action_size)
-        self.value_out = tf.keras.layers.Dense(1 * atom_size)
-        self.norm_advantage_output = tf.keras.layers.Lambda(lambda x: x - tf.reduce_mean(x))
-        self.build((None, state_size))
-
-    @tf.function
-    def call(self, input_tensor):
-        dist = self.dist(input_tensor)
-        x = tf.reduce_sum(dist * self.support, axis=2)
-        return x
-
-    @tf.function
-    def dist(self, x):
-        x = self.fc1(x)
-        x = tf.nn.relu(x)
-        x = self.fc2(x)
-        x = tf.nn.relu(x)
-        y = self.advantage_output(x)
-        y = self.norm_advantage_output(y)
-        y = tf.reshape(y, (-1, action_size, self.atom_size))
-        z = self.value_out(x)
-        z = tf.reshape(z, (-1, 1, self.atom_size))
-        x = y + z
-        dist = tf.nn.softmax(x, axis=-1)
-        return dist
-
+    model.compile(optimizer=tf.keras.optimizers.Adam(lr),
+                  loss='mse',
+                  metrics=['accuracy'])
+    return model
 
 class DQNAgent:
     def __init__(self):
@@ -92,35 +71,49 @@ class DQNAgent:
         self.fixed_q_value_steps = 100
         self.target_network_counter = 0
 
+        # n-step learning
+        self.n_step = 3
+        self.n_step_buffer = deque(maxlen=self.n_step)
+
         # experience replay
         self.batch_size = 64
         self.gamma = 0.9
         self.replay_start_size = 320
         self.experience_replay = deque(maxlen=memory_size)
 
-        # categorical DQN
-        self.optimizer = tf.keras.optimizers.Adam(self.learning_rate)
-        self.v_min = 0.0
-        self.v_max = 200.0
-        self.atom_size = 51
-        self.support = np.linspace(
-            self.v_min, self.v_max, self.atom_size
-        )
-        self.delta_z = float(self.v_max - self.v_min) / (self.atom_size - 1)
         if self.load_model:
             self.model = keras.models.load_model(saveFileName + '.h5')
             self.target_model = keras.models.load_model(saveFileName + '.h5')
         else:
-            self.model = Network(self.support, self.atom_size)
-            self.target_model = Network(self.support, self.atom_size)
+            self.model = create_model(self.learning_rate)
+            self.target_model = create_model(self.learning_rate)
             # self.target_model.predict(np.zeros((1,state_size)))
+
+    # n-step learning, get the truncated n-step return
+    def get_n_step_info(self, n_step_buffer, gamma):
+        """Return n step reward, next state, and done."""
+        # info of the last transition
+        reward, next_state, done = n_step_buffer[-1][-3:]
+
+        for transition in reversed(list(n_step_buffer)[:-1]):
+            r, n_s, d = transition[-3:]
+
+            reward = r + gamma * reward * (1 - d)
+            next_state, done = (n_s, d) if d else (next_state, done)
+
+        return reward, next_state, done
 
     # these methods:sample,store are used in experience replay
     def sample(self, n):
         return random.sample(self.experience_replay, n)
 
     def store(self, experience):
-        self.experience_replay.append((state, action, reward, next_state, done))
+        # n_step
+        self.n_step_buffer.append(experience)
+        if len(self.n_step_buffer) == self.n_step:
+            reward, next_state, done = self.get_n_step_info(self.n_step_buffer, self.gamma)
+            state, action = self.n_step_buffer[0][:2]
+            self.experience_replay.append((state, action, reward, next_state, done))
 
     def training(self):
         if len(self.experience_replay) >= self.replay_start_size:
@@ -130,52 +123,40 @@ class DQNAgent:
             rewards = np.vstack([data[2] for data in batches])
             next_states = np.vstack([data[3] for data in batches])
             dones = np.vstack([data[4] for data in batches])
-            self.train_body(states, actions, rewards, next_states, dones)
+            self._train_body(states, actions, rewards, next_states, dones)
 
     @tf.function
-    def train_body(self, states, actions, rewards, next_states, dones):
+    def _train_body(self, states, actions, rewards, next_states, dones):
         with tf.GradientTape() as tape:
-            elementwise_loss = self._compute_td_error_body(states, actions, rewards, next_states, dones)
-            absolute_errors = tf.abs(elementwise_loss)
-            loss = tf.reduce_mean(elementwise_loss)
+            td_errors = self._compute_td_error_body(states, actions, rewards, next_states, dones)
+            loss = tf.reduce_mean(tf.square(td_errors))
         gradients = tape.gradient(loss, self.model.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-        return absolute_errors
+        self.model.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+        return td_errors
 
     @tf.function
     def _compute_td_error_body(self, states, actions, rewards, next_states, dones):
-        # DDQN double DQN: choose action first in current network,
-        # no axis=1 will only have one value
-        max_action_next = tf.argmax(self.model(next_states), axis=1)
-        batch_size_range = tf.expand_dims(tf.range(self.batch_size, dtype=tf.int64), axis=1)  # (batch_size, 1)
-        max_action_next = tf.expand_dims(max_action_next, axis=1)
-        next_indexes = tf.concat(values=(batch_size_range, max_action_next), axis=1)  # (batch_size, 2)
-        next_dist = self.target_model.dist(next_states)
-        next_dist = tf.gather_nd(next_dist, next_indexes)
+        rewards = tf.cast(tf.squeeze(rewards), dtype=tf.float32)
+        dones = tf.cast(tf.squeeze(dones), dtype=tf.bool)
+        actions = tf.cast(actions, dtype=tf.int32)  # (batch_size, 1)
+        batch_size_range = tf.expand_dims(tf.range(self.batch_size), axis=1)  # (batch_size, 1)
 
-        t_z = tf.where(dones, rewards, rewards + self.gamma * self.support)  # (batch_size, )
-        t_z = tf.clip_by_value(t_z, self.v_min, self.v_max)
-        b = tf.cast((t_z - self.v_min) / self.delta_z, tf.float32)
-        l = tf.cast(tf.math.floor(b), tf.int32)
-        u = tf.cast(tf.math.ceil(b), tf.int32)
+        # get current q value
+        current_q_indexes = tf.concat(values=(batch_size_range, actions), axis=1)  # (batch_size, 2)
+        current_q = tf.gather_nd(self.model(states), current_q_indexes)  # (batch_size, )
 
-        offset = tf.tile(tf.cast(tf.linspace(0., (self.batch_size - 1.) * self.atom_size, self.batch_size
-                                             ), tf.int32)[:, None], (1, self.atom_size))
-        proj_dist = tf.zeros(next_dist.shape, dtype=tf.float32)
-        loffset = tf.reshape((l + offset), (-1,))
-        uoffset = tf.reshape((u + offset), (-1,))
-        u_next = tf.reshape((next_dist * (tf.cast(u, tf.float32) - b)), (-1,))
-        l_next = tf.reshape((next_dist * (b - tf.cast(l, tf.float32))), (-1,))
+        # get target q value using double dqn
+        max_next_q_indexes = tf.argmax(self.model(next_states), axis=1, output_type=tf.int32)  # (batch_size, )
+        indexes = tf.concat(values=(batch_size_range,
+                                    tf.expand_dims(max_next_q_indexes, axis=1)), axis=1)  # (batch_size, 2)
+        target_q = tf.gather_nd(self.target_model(next_states), indexes)  # (batch_size, )
 
-        proj_dist = tf.add(tf.reshape(proj_dist, (-1,)), tf.gather(u_next, loffset))
-        proj_dist = tf.add(tf.reshape(proj_dist, (-1,)), tf.gather(l_next, uoffset))
-        proj_dist = tf.reshape(proj_dist, (self.batch_size, self.atom_size))
-
-        dist = self.model.dist(states)
-        indexes = tf.concat(values=(batch_size_range, actions), axis=1)  # (batch_size, 2)
-        log_p = tf.math.log(tf.gather_nd(dist, indexes))
-        loss = tf.reduce_sum(-(proj_dist * log_p), axis=1)
-        return loss
+        n_gamma = self.gamma ** self.n_step
+        target_q = tf.where(dones, rewards, rewards + n_gamma * target_q)  # (batch_size, )
+        # don't want change the weights of target network in backpropagation, so tf.stop_gradient()
+        # but seems no use
+        td_errors = tf.abs(current_q - tf.stop_gradient(target_q))
+        return td_errors
 
     def acting(self, state):
         if self.render:
@@ -239,11 +220,11 @@ plt.figure(figsize=(20,5))
 plt.plot(np.arange(episodes), np.mean(plot_rewards, axis=0))
 plt.xlabel('Episodes')
 plt.ylabel('Rewards')
-plt.savefig('C51_ER.png')
+plt.savefig('DQN_ER_nstep.png')
 print('plotted')
 
 import pickle
-with open('c51_er.pkl','wb') as f:
+with open('dqn_er_nstep.pkl','wb') as f:
     pickle.dump(np.mean(plot_rewards, axis=0), f)
 env.close()
 
